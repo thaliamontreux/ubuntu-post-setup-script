@@ -1,0 +1,804 @@
+#!/usr/bin/env bash
+# Minimal Server TUI Menu for Ubuntu 24.04 (non-graphical)
+# FIXED (robust):
+# - dialog output capture uses --output-fd 3 + /dev/tty to prevent escape sequences in variables
+# - firewall advanced rule wizard supports: direction, interface, src/dst ip/cidr, src/dst port, proto, comment
+# - manage rules: delete / replace (delete + add) / add raw / add wizard
+# - safe under set -euo pipefail
+
+# Check for TTY
+if ! tty -s; then
+  echo "This script requires an interactive terminal (TTY). Please run it in a terminal emulator."
+  exit 1
+fi
+
+APP_TITLE="Minimal Server Menu (Ubuntu 24.04)"
+DIALOG_HEIGHT=22
+DIALOG_WIDTH=78
+
+set -euo pipefail
+
+# ---------------- Core helpers ----------------
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+trim() {
+  local s="${1:-}"
+  s="${s//$'\r'/}"
+  s="${s//$'\n'/}"
+  # leading spaces
+  s="${s#"${s%%[![:space:]]*}"}"
+  # trailing spaces
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# ---------------- Error handling ----------------
+error_handler() {
+  local exit_code=$1
+  local line_no=$2
+  local command=$3
+  local error_msg="Error at line $line_no: command '$command' failed with exit code $exit_code"
+  echo "$(date): $error_msg" >> ./error.log
+
+  if have_cmd dialog; then
+    dialog --title "Error" --msgbox "$error_msg" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" >/dev/tty 2>/dev/tty || true
+  elif have_cmd whiptail; then
+    whiptail --title "Error" --msgbox "$error_msg" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" >/dev/tty 2>/dev/tty || true
+  else
+    echo "Error: $error_msg" >&2
+  fi
+  exit "$exit_code"
+}
+trap 'error_handler $? $LINENO "$BASH_COMMAND"' ERR
+
+# ---------------- Logging ----------------
+declare -a ACTION_LOG=()
+log_action() {
+  local action="$1"
+  ACTION_LOG+=("$action")
+  echo "$(date): $action" >> ./setup.log
+}
+
+# ---------------- Cleanup ----------------
+cleanup() { :; }
+trap cleanup EXIT
+
+# ---------------- apt helpers ----------------
+apt_update_once() {
+  if [[ -z "${_APT_UPDATED:-}" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    _APT_UPDATED=1
+  fi
+}
+
+install_pkgs() {
+  local pkgs=("$@")
+  [[ "${#pkgs[@]}" -eq 0 ]] && return 0
+  apt_update_once
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y "${pkgs[@]}"
+}
+
+is_installed() { dpkg -s "$1" >/dev/null 2>&1; }
+
+# ---------------- UI backend selection ----------------
+UI_CMD=""
+ensure_ui() {
+  if have_cmd whiptail; then
+    UI_CMD="whiptail"
+  elif have_cmd dialog; then
+    UI_CMD="dialog"
+  else
+    echo "Installing 'whiptail' (preferred) and 'dialog' (fallback)..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y whiptail dialog
+    UI_CMD="whiptail"
+  fi
+}
+
+# ---------------- Bulletproof dialog capture ----------------
+# For dialog: send all screen output to /dev/tty, capture only selection via FD 3 into a file.
+dialog_capture() {
+  # Usage: dialog_capture <tmpfile> <dialog args...>
+  local tmp="$1"; shift
+  : > "$tmp"
+  dialog --clear --output-fd 3 "$@" 3>"$tmp" >/dev/tty 2>/dev/tty
+}
+
+# ---------------- UI wrappers ----------------
+ui_msg() {
+  local title="${1:-Message}"
+  local msg="${2:-}"
+  if [[ "${UI_CMD:-whiptail}" == "dialog" ]]; then
+    dialog --clear --title "$title" --msgbox "$msg" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" >/dev/tty 2>/dev/tty || true
+  else
+    whiptail --title "$title" --msgbox "$msg" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" >/dev/tty 2>/dev/tty || true
+  fi
+}
+
+ui_yesno() {
+  local title="${1:-Confirm}"
+  local msg="${2:-}"
+  if [[ "${UI_CMD:-whiptail}" == "dialog" ]]; then
+    dialog --clear --title "$title" --yesno "$msg" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" >/dev/tty 2>/dev/tty
+  else
+    whiptail --title "$title" --yesno "$msg" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" >/dev/tty 2>/dev/tty
+  fi
+}
+
+ui_input() {
+  local title="$1" prompt="$2" default="${3:-}"
+  local out=""
+  if [[ "${UI_CMD:-whiptail}" == "dialog" ]]; then
+    local tmp; tmp="$(mktemp)"
+    dialog_capture "$tmp" --title "$title" --inputbox "$prompt" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" "$default" || { rm -f "$tmp"; return 1; }
+    out="$(cat "$tmp")"
+    rm -f "$tmp"
+  else
+    out="$(whiptail --title "$title" --inputbox "$prompt" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" "$default" 3>&1 1>&2 2>&3)" || return 1
+  fi
+  trim "$out"
+}
+
+ui_menu() {
+  local title="$1" prompt="$2"
+  shift 2
+  local out=""
+  if [[ "${UI_CMD:-whiptail}" == "dialog" ]]; then
+    local tmp; tmp="$(mktemp)"
+    dialog_capture "$tmp" --title "$title" --menu "$prompt" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" 14 "$@" || { rm -f "$tmp"; return 1; }
+    out="$(cat "$tmp")"
+    rm -f "$tmp"
+  else
+    out="$(whiptail --title "$title" --menu "$prompt" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" 14 "$@" 3>&1 1>&2 2>&3)" || return 1
+  fi
+  trim "$out"
+}
+
+ui_checklist() {
+  local title="$1" prompt="$2"
+  shift 2
+  local out=""
+  if [[ "${UI_CMD:-whiptail}" == "dialog" ]]; then
+    local tmp; tmp="$(mktemp)"
+    dialog_capture "$tmp" --title "$title" --checklist "$prompt" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" 14 "$@" || { rm -f "$tmp"; return 1; }
+    out="$(cat "$tmp")"
+    rm -f "$tmp"
+  else
+    out="$(whiptail --title "$title" --checklist "$prompt" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" 14 "$@" 3>&1 1>&2 2>&3)" || return 1
+  fi
+  trim "$out"
+}
+
+ui_textbox() {
+  local title="$1"
+  local content="$2"
+  local tmp
+  tmp="$(mktemp)"
+  printf '%s\n' "$content" > "$tmp"
+
+  if [[ "${UI_CMD:-whiptail}" == "dialog" ]]; then
+    dialog --clear --title "$title" --textbox "$tmp" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" >/dev/tty 2>/dev/tty || true
+  else
+    whiptail --title "$title" --textbox "$tmp" "$DIALOG_HEIGHT" "$DIALOG_WIDTH" >/dev/tty 2>/dev/tty || true
+  fi
+  rm -f "$tmp"
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    ensure_ui
+    ui_msg "Error" "This script must run as root.\nRe-run with: sudo $0"
+    exit 1
+  fi
+}
+
+# ---------------- Batch & Groups ----------------
+declare -a BATCH_PACKAGES=()
+declare -A GROUP_MAP=()
+declare -A PROFILE_MAP=()
+
+add_pkg_unique() {
+  local p="$1"
+  for e in "${BATCH_PACKAGES[@]}"; do
+    [[ "$e" == "$p" ]] && return 0
+  done
+  BATCH_PACKAGES+=("$p")
+}
+
+add_group_to_batch() {
+  local group="$1"
+  local pkgs="${GROUP_MAP[$group]:-}"
+  for p in $pkgs; do add_pkg_unique "$p"; done
+}
+
+clear_batch() { BATCH_PACKAGES=(); }
+
+show_batch() {
+  if [[ "${#BATCH_PACKAGES[@]}" -eq 0 ]]; then
+    ui_msg "Batch" "Batch is empty."
+  else
+    ui_msg "Batch" "Current batch packages:\n\n${BATCH_PACKAGES[*]}"
+  fi
+}
+
+install_batch_now() {
+  if [[ "${#BATCH_PACKAGES[@]}" -eq 0 ]]; then
+    ui_msg "Install" "No packages selected in batch."
+    return 0
+  fi
+  local pkgs="${BATCH_PACKAGES[*]}"
+  if ui_yesno "Install Batch" "Install the following packages?\n\n$pkgs\n"; then
+    if install_pkgs "${BATCH_PACKAGES[@]}"; then
+      ui_msg "Install" "Installation completed."
+      log_action "Installed batch packages: ${BATCH_PACKAGES[*]}"
+    else
+      ui_msg "Install" "Installation failed."
+    fi
+  fi
+}
+
+init_groups_and_profiles() {
+  GROUP_MAP["nginx"]="nginx"
+  GROUP_MAP["apache2"]="apache2"
+  GROUP_MAP["php"]="php php-cli php-fpm php-curl php-xml php-mbstring php-zip php-gd"
+  GROUP_MAP["perl"]="perl cpanminus"
+  GROUP_MAP["python3 core"]="python3 python-is-python3 python3-venv python3-pip python3-dev"
+  GROUP_MAP["editors"]="joe nano vim"
+  GROUP_MAP["git & vcs"]="git git-lfs"
+  GROUP_MAP["network tools"]="curl wget ca-certificates openssh-server rsync net-tools iproute2 dnsutils"
+  GROUP_MAP["build essentials (C/C++)"]="build-essential gdb cmake make pkg-config clang lld lldb"
+  GROUP_MAP["monitoring"]="htop iotop nload iftop"
+  GROUP_MAP["system utilities"]="tmux screen lsof strace"
+  GROUP_MAP["ufw firewall"]="ufw"
+  GROUP_MAP["fail2ban"]="fail2ban"
+  GROUP_MAP["unattended upgrades"]="unattended-upgrades"
+
+  PROFILE_MAP["Web Server Profile"]="openssh-server ufw nginx apache2 php"
+  PROFILE_MAP["Dev Profile"]="build-essential git git-lfs python3 python-is-python3 python3-venv python3-pip python3-dev"
+  PROFILE_MAP["Ops Profile"]="curl wget ca-certificates rsync net-tools iproute2 dnsutils htop tmux lsof strace"
+  PROFILE_MAP["Hardened Profile"]="ufw fail2ban unattended-upgrades"
+}
+
+profiles_menu() {
+  local items=()
+  local i=1
+  local keys=()
+  for k in "${!PROFILE_MAP[@]}"; do
+    keys+=("$k")
+    items+=("$i" "$k" "off")
+    ((i++))
+  done
+  local selected
+  selected="$(ui_checklist "Profiles" "Select profiles to add to batch:" "${items[@]}")" || return 0
+  [[ -z "$selected" ]] && { ui_msg "Profiles" "Nothing selected."; return 0; }
+
+  for token in $selected; do
+    token="${token//\"/}"
+    local idx=$((token-1))
+    [[ $idx -ge 0 && $idx -lt ${#keys[@]} ]] || continue
+    local prof="${keys[$idx]}"
+    for p in ${PROFILE_MAP[$prof]}; do add_pkg_unique "$p"; done
+  done
+  ui_msg "Batch" "Selected profiles added to batch."
+}
+
+software_groups_menu() {
+  local items=()
+  local i=1
+  local keys=()
+  for k in "${!GROUP_MAP[@]}"; do
+    keys+=("$k")
+    items+=("$i" "$k" "off")
+    ((i++))
+  done
+  local selected
+  selected="$(ui_checklist "Software Groups" "Select groups to add to batch:" "${items[@]}")" || return 0
+  [[ -z "$selected" ]] && { ui_msg "Software Groups" "Nothing selected."; return 0; }
+
+  for token in $selected; do
+    token="${token//\"/}"
+    local idx=$((token-1))
+    [[ $idx -ge 0 && $idx -lt ${#keys[@]} ]] || continue
+    add_group_to_batch "${keys[$idx]}"
+  done
+  ui_msg "Batch" "Selected groups added to batch."
+}
+
+# ---------------- Hostname ----------------
+update_hosts_file() {
+  local new="$1"
+  if grep -qE '^\s*127\.0\.1\.1\s+' /etc/hosts; then
+    sed -i -E "s/^\s*127\.0\.1\.1\s+.*/127.0.1.1\t${new}/" /etc/hosts
+  else
+    echo -e "127.0.1.1\t${new}" >> /etc/hosts
+  fi
+}
+
+change_hostname() {
+  local current
+  current="$(hostnamectl --static 2>/dev/null || hostname)"
+  local new
+  new="$(ui_input "Hostname" "Enter new hostname (letters/numbers/hyphens).\nCurrent: $current" "$current")" || return 0
+
+  [[ -z "$new" ]] && { ui_msg "Hostname" "Hostname cannot be empty."; return 0; }
+  if ! [[ "$new" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+    ui_msg "Hostname" "Invalid hostname.\nUse letters, numbers, hyphens; 1-63 chars; cannot start/end with hyphen."
+    return 0
+  fi
+  hostnamectl set-hostname "$new"
+  update_hosts_file "$new"
+  hostnamectl set-hostname --transient "$new" || true
+  ui_msg "Hostname" "Hostname updated.\n\nNow: $(hostname)\nStatic: $(hostnamectl --static)"
+  log_action "Changed hostname to $new"
+}
+
+# ---------------- Services ----------------
+service_is_known() { systemctl list-unit-files "${1}.service" >/dev/null 2>&1; }
+
+services_menu() {
+  local services=("ssh" "nginx" "apache2" "php8.3-fpm" "fail2ban" "ufw")
+  while true; do
+    local items=()
+    local i=1
+    for s in "${services[@]}"; do
+      local tag="(missing)"
+      if service_is_known "$s"; then
+        local enabled="disabled"; systemctl is-enabled "$s" >/dev/null 2>&1 && enabled="enabled"
+        local active="inactive"; systemctl is-active "$s" >/dev/null 2>&1 && active="active"
+        tag="($active/$enabled)"
+      fi
+      items+=("$i" "$s $tag")
+      ((i++))
+    done
+    items+=("$i" "Back")
+
+    local choice
+    choice="$(ui_menu "Services" "Select a service:" "${items[@]}")" || return 0
+    [[ "$choice" -eq "$i" ]] && return 0
+    local svc="${services[$((choice-1))]}"
+
+    if ! service_is_known "$svc"; then
+      ui_msg "Services" "Service '$svc' not found.\nInstall its package first."
+      continue
+    fi
+
+    local action
+    action="$(ui_menu "Service: $svc" "Choose action:" \
+      1 "Status" \
+      2 "Start" \
+      3 "Stop" \
+      4 "Restart" \
+      5 "Enable on boot" \
+      6 "Disable on boot" \
+      7 "Logs (journalctl)" \
+      8 "Back")" || continue
+
+    case "$action" in
+      1) ui_textbox "Status: $svc" "$(systemctl status "$svc" --no-pager 2>&1 || true)" ;;
+      2) systemctl start "$svc" >/dev/null 2>&1 || true; ui_msg "Service" "Start requested." ;;
+      3) systemctl stop "$svc" >/dev/null 2>&1 || true; ui_msg "Service" "Stop requested." ;;
+      4) systemctl restart "$svc" >/dev/null 2>&1 || true; ui_msg "Service" "Restart requested." ;;
+      5) systemctl enable "$svc" >/dev/null 2>&1 || true; ui_msg "Service" "Enable requested." ;;
+      6) systemctl disable "$svc" >/dev/null 2>&1 || true; ui_msg "Service" "Disable requested." ;;
+      7) ui_textbox "Logs: $svc" "$(journalctl -u "$svc" -n 200 --no-pager 2>&1 || true)" ;;
+      8) : ;;
+    esac
+  done
+}
+
+# ---------------- Firewall (UFW) ----------------
+ensure_ufw() {
+  if ! have_cmd ufw; then
+    if ui_yesno "Firewall" "ufw is not installed.\nInstall ufw now?"; then
+      install_pkgs ufw || { ui_msg "Firewall" "Failed to install ufw."; return 1; }
+    else
+      return 1
+    fi
+  fi
+  return 0
+}
+
+ufw_is_active() { ufw status 2>/dev/null | head -1 | grep -qi "active"; }
+
+declare -a RULE_NUMS=()
+declare -a RULE_TEXTS=()
+
+ufw_refresh_rules() {
+  RULE_NUMS=()
+  RULE_TEXTS=()
+  local out
+  out="$(ufw status numbered 2>&1 || true)"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^\[[[:space:]]*([0-9]+)\][[:space:]]*(.*)$ ]]; then
+      RULE_NUMS+=("${BASH_REMATCH[1]}")
+      RULE_TEXTS+=("${BASH_REMATCH[2]}")
+    fi
+  done <<< "$out"
+}
+
+is_cidr_or_ip_or_any() {
+  local v="$1"
+  [[ "$v" == "any" ]] && return 0
+  [[ "$v" =~ ^[0-9a-fA-F\.:/]+$ ]]
+}
+
+is_port_or_any() {
+  local v="$1"
+  [[ "$v" == "any" ]] && return 0
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  (( v >= 1 && v <= 65535 ))
+}
+
+pick_action() {
+  local c
+  c="$(ui_menu "UFW" "Rule action:" \
+    1 "allow" \
+    2 "deny" \
+    3 "reject" \
+    4 "limit")" || return 1
+  case "$c" in
+    1) echo "allow" ;;
+    2) echo "deny" ;;
+    3) echo "reject" ;;
+    4) echo "limit" ;;
+  esac
+}
+
+pick_direction() {
+  local c
+  c="$(ui_menu "UFW" "Direction:" \
+    1 "in" \
+    2 "out" \
+    3 "any (omit)")" || return 1
+  case "$c" in
+    1) echo "in" ;;
+    2) echo "out" ;;
+    3) echo "" ;;
+  esac
+}
+
+pick_proto() {
+  local c
+  c="$(ui_menu "UFW" "Protocol:" \
+    1 "tcp" \
+    2 "udp" \
+    3 "any")" || return 1
+  case "$c" in
+    1) echo "tcp" ;;
+    2) echo "udp" ;;
+    3) echo "any" ;;
+  esac
+}
+
+pick_interface() {
+  local which="$1"
+  ui_yesno "UFW" "Bind to a specific ${which} interface?" || { echo ""; return 0; }
+  local iface
+  iface="$(ui_input "UFW" "Enter interface name (e.g., eth0, enp0s3):" "")" || return 1
+  [[ -n "$iface" ]] || return 1
+  echo "$iface"
+}
+
+ufw_build_rule_tail() {
+  local action="$1" direction="$2" iface="$3"
+  local src="$4" src_port="$5"
+  local dst="$6" dst_port="$7"
+  local proto="$8" comment="${9:-}"
+
+  local cmd="$action"
+  if [[ -n "$direction" ]]; then
+    cmd+=" $direction"
+    [[ -n "$iface" ]] && cmd+=" on $iface"
+  fi
+
+  cmd+=" from $src"
+  [[ "$src_port" != "any" ]] && cmd+=" port $src_port"
+  cmd+=" to $dst"
+  [[ "$dst_port" != "any" ]] && cmd+=" port $dst_port"
+  [[ "$proto" != "any" ]] && cmd+=" proto $proto"
+
+  if [[ -n "$comment" ]]; then
+    cmd+=" comment $(printf "%q" "$comment")"
+  fi
+
+  echo "$cmd"
+}
+
+ufw_rule_wizard() {
+  ensure_ufw || return 0
+
+  local action direction proto iface
+  action="$(pick_action)" || return 0
+  direction="$(pick_direction)" || return 0
+  proto="$(pick_proto)" || return 0
+
+  iface=""
+  if [[ "$direction" == "in" ]]; then
+    iface="$(pick_interface "incoming")" || return 0
+  elif [[ "$direction" == "out" ]]; then
+    iface="$(pick_interface "outgoing")" || return 0
+  fi
+
+  local src dst src_port dst_port comment
+  src="$(ui_input "UFW Rule" "Source IP/CIDR (or 'any'):" "any")" || return 0
+  is_cidr_or_ip_or_any "$src" || { ui_msg "UFW" "Invalid source. Use 'any', IP, or CIDR."; return 0; }
+
+  dst="$(ui_input "UFW Rule" "Destination IP/CIDR (or 'any'):" "any")" || return 0
+  is_cidr_or_ip_or_any "$dst" || { ui_msg "UFW" "Invalid destination. Use 'any', IP, or CIDR."; return 0; }
+
+  src_port="$(ui_input "UFW Rule" "Source port (or 'any'):" "any")" || return 0
+  is_port_or_any "$src_port" || { ui_msg "UFW" "Invalid source port."; return 0; }
+
+  dst_port="$(ui_input "UFW Rule" "Destination port (or 'any'):" "any")" || return 0
+  is_port_or_any "$dst_port" || { ui_msg "UFW" "Invalid destination port."; return 0; }
+
+  comment="$(ui_input "UFW Rule" "Optional comment (blank for none):" "")" || true
+
+  local tail
+  tail="$(ufw_build_rule_tail "$action" "$direction" "$iface" "$src" "$src_port" "$dst" "$dst_port" "$proto" "$comment")"
+
+  ui_textbox "UFW Rule Preview" "About to run:\n\nufw $tail\n"
+  if ui_yesno "UFW" "Apply this rule?"; then
+    ufw $tail >/dev/null 2>&1 || { ui_msg "UFW" "Failed to apply rule."; return 0; }
+    ui_msg "UFW" "Rule applied."
+  fi
+}
+
+ufw_manage_rules() {
+  ensure_ufw || return 0
+
+  if ! ufw_is_active; then
+    if ui_yesno "UFW" "UFW is inactive.\nEnable it now?"; then
+      ufw --force enable >/dev/null 2>&1 || true
+    fi
+  fi
+
+  while true; do
+    ufw_refresh_rules
+
+    local items=()
+    for i in "${!RULE_NUMS[@]}"; do
+      items+=("${RULE_NUMS[$i]}" "${RULE_TEXTS[$i]}")
+    done
+    items+=("add_adv" "Add rule (wizard: iface, IP/CIDR, ports, proto, comment)")
+    items+=("add_raw" "Add rule (raw ufw rule tail)")
+    items+=("back" "Back")
+
+    local choice
+    choice="$(ui_menu "UFW Rules" "Select a rule number to delete/replace, or add a new one:" "${items[@]}")" || return 0
+
+    case "$choice" in
+      add_adv) ufw_rule_wizard; continue ;;
+      add_raw)
+        local raw
+        raw="$(ui_input "UFW" "Enter raw ufw rule tail.\nExample:\nallow in on eth0 from 10.0.0.0/8 to any port 22 proto tcp" "")" || continue
+        [[ -z "$raw" ]] && { ui_msg "UFW" "Rule cannot be empty."; continue; }
+        ui_textbox "UFW Preview" "About to run:\n\nufw $raw\n"
+        if ui_yesno "UFW" "Apply this rule?"; then
+          ufw $raw >/dev/null 2>&1 || { ui_msg "UFW" "Failed to add rule."; continue; }
+          ui_msg "UFW" "Rule added."
+        fi
+        continue
+        ;;
+      back) return 0 ;;
+    esac
+
+    local found_i=-1
+    for i in "${!RULE_NUMS[@]}"; do
+      [[ "${RULE_NUMS[$i]}" == "$choice" ]] && { found_i="$i"; break; }
+    done
+    [[ "$found_i" -ge 0 ]] || { ui_msg "UFW" "Rule not found. Refresh and try again."; continue; }
+
+    local current="${RULE_TEXTS[$found_i]}"
+    local act
+    act="$(ui_menu "Rule #$choice" "Current:\n$current\n\nChoose action:" \
+      1 "Delete rule" \
+      2 "Replace rule (delete then add via wizard)" \
+      3 "Back")" || continue
+
+    case "$act" in
+      1)
+        if ui_yesno "UFW" "Delete rule #$choice?\n\n$current"; then
+          ufw --force delete "$choice" >/dev/null 2>&1 || { ui_msg "UFW" "Failed to delete."; continue; }
+          ui_msg "UFW" "Deleted."
+        fi
+        ;;
+      2)
+        if ui_yesno "UFW" "Replace rule #$choice?\n\nThis deletes then adds a new one."; then
+          ufw --force delete "$choice" >/dev/null 2>&1 || { ui_msg "UFW" "Failed to delete existing."; continue; }
+          ufw_rule_wizard
+        fi
+        ;;
+      3) : ;;
+    esac
+  done
+}
+
+ufw_enable_disable() {
+  ensure_ufw || return 0
+  local current="disabled"
+  ufw_is_active && current="enabled"
+
+  local choice
+  choice="$(ui_menu "UFW Enable/Disable" "Current status: $current" \
+    1 "Enable UFW" \
+    2 "Disable UFW" \
+    3 "Back")" || return 0
+
+  case "$choice" in
+    1) ufw --force enable >/dev/null 2>&1 || true; ui_msg "UFW" "Enable requested." ;;
+    2) ufw --force disable >/dev/null 2>&1 || true; ui_msg "UFW" "Disable requested." ;;
+    3) return 0 ;;
+  esac
+}
+
+ufw_default_policy() {
+  ensure_ufw || return 0
+  local choice
+  choice="$(ui_menu "UFW Default Policies" "Set default policies:" \
+    1 "Default incoming: deny" \
+    2 "Default incoming: allow" \
+    3 "Default outgoing: deny" \
+    4 "Default outgoing: allow" \
+    5 "Back")" || return 0
+
+  case "$choice" in
+    1) ufw default deny incoming >/dev/null 2>&1 || true; ui_msg "UFW" "Incoming deny set." ;;
+    2) ufw default allow incoming >/dev/null 2>&1 || true; ui_msg "UFW" "Incoming allow set." ;;
+    3) ufw default deny outgoing >/dev/null 2>&1 || true; ui_msg "UFW" "Outgoing deny set." ;;
+    4) ufw default allow outgoing >/dev/null 2>&1 || true; ui_msg "UFW" "Outgoing allow set." ;;
+    5) return 0 ;;
+  esac
+}
+
+ufw_allow_common() {
+  ensure_ufw || return 0
+  local choice
+  choice="$(ui_menu "UFW Allow Common" "Allow common services:" \
+    1 "SSH (22/tcp)" \
+    2 "HTTP (80/tcp)" \
+    3 "HTTPS (443/tcp)" \
+    4 "All three" \
+    5 "Back")" || return 0
+
+  case "$choice" in
+    1) ufw allow ssh >/dev/null 2>&1 || true; ui_msg "UFW" "SSH allowed." ;;
+    2) ufw allow http >/dev/null 2>&1 || true; ui_msg "UFW" "HTTP allowed." ;;
+    3) ufw allow https >/dev/null 2>&1 || true; ui_msg "UFW" "HTTPS allowed." ;;
+    4)
+      ufw allow ssh >/dev/null 2>&1 || true
+      ufw allow http >/dev/null 2>&1 || true
+      ufw allow https >/dev/null 2>&1 || true
+      ui_msg "UFW" "SSH/HTTP/HTTPS allowed."
+      ;;
+    5) return 0 ;;
+  esac
+}
+
+firewall_menu() {
+  while true; do
+    local choice
+    choice="$(ui_menu "Firewall (UFW)" "Select an action:" \
+      1 "Manage rules (list/delete/replace/add)" \
+      2 "Enable/Disable UFW" \
+      3 "Set default policies" \
+      4 "Allow common services" \
+      5 "Add rule (wizard)" \
+      6 "Back")" || return 0
+
+    case "$choice" in
+      1) ufw_manage_rules ;;
+      2) ufw_enable_disable ;;
+      3) ufw_default_policy ;;
+      4) ufw_allow_common ;;
+      5) ufw_rule_wizard ;;
+      6) return 0 ;;
+    esac
+  done
+}
+
+# ---------------- System info ----------------
+show_system_info() {
+  local info
+  info=$(
+    echo "Hostname: $(hostname)"
+    echo "OS: $(. /etc/os-release; echo "$PRETTY_NAME")"
+    echo "Kernel: $(uname -r)"
+    echo "Uptime: $(uptime -p 2>/dev/null || uptime)"
+    echo
+    echo "IP addrs:"
+    ip -br a 2>/dev/null || true
+    echo
+    echo "Disk:"
+    df -hT 2>/dev/null || true
+  )
+  ui_textbox "System Info" "$info"
+}
+
+system_update_upgrade() {
+  if ui_yesno "System" "Run apt update && apt upgrade now?"; then
+    apt_update_once
+    export DEBIAN_FRONTEND=noninteractive
+    if apt-get upgrade -y; then
+      ui_msg "System" "Upgrade completed."
+    else
+      ui_msg "System" "Upgrade failed."
+    fi
+  fi
+}
+
+# ---------------- Quick setup wizard ----------------
+quick_setup_wizard() {
+  local role
+  role="$(ui_menu "Quick Setup" "Select server role:" \
+    1 "Web Server (Nginx + PHP)" \
+    2 "Dev Machine (Git + Python + Tools)" \
+    3 "Basic Server (SSH + UFW)" \
+    4 "Back")" || return 0
+
+  case "$role" in
+    1) add_group_to_batch "nginx"; add_group_to_batch "php"; add_group_to_batch "ufw firewall"; log_action "Selected Web Server role" ;;
+    2) add_group_to_batch "git & vcs"; add_group_to_batch "python3 core"; add_group_to_batch "editors"; add_group_to_batch "build essentials (C/C++)"; log_action "Selected Dev Machine role" ;;
+    3) add_group_to_batch "network tools"; add_group_to_batch "ufw firewall"; log_action "Selected Basic Server role" ;;
+    4) return 0 ;;
+  esac
+
+  if ui_yesno "Quick Setup" "Install selected packages now?"; then
+    install_batch_now
+  else
+    ui_msg "Quick Setup" "Packages added to batch. Use 'Install batch now' from main menu."
+  fi
+}
+
+# ---------------- Main menu ----------------
+main_menu() {
+  while true; do
+    local choice
+    choice="$(ui_menu "Main Menu" "Choose an option:" \
+      1 "System info" \
+      2 "Change hostname (immediate)" \
+      3 "Profiles (add bundles to batch)" \
+      4 "Software groups (add to batch)" \
+      5 "View current batch" \
+      6 "Install batch now" \
+      7 "Clear batch" \
+      8 "Services (systemctl manager)" \
+      9 "Firewall (UFW) administration" \
+      10 "Update & upgrade system" \
+      11 "Quick setup wizard" \
+      12 "Exit")" || return 0
+
+    case "$choice" in
+      1) show_system_info ;;
+      2) change_hostname ;;
+      3) profiles_menu ;;
+      4) software_groups_menu ;;
+      5) show_batch ;;
+      6) install_batch_now ;;
+      7) clear_batch; ui_msg "Batch" "Batch cleared." ;;
+      8) services_menu ;;
+      9) firewall_menu ;;
+      10) system_update_upgrade ;;
+      11) quick_setup_wizard ;;
+      12) break ;;
+    esac
+  done
+}
+
+main() {
+  echo "Starting script..." >> ./error.log
+  require_root
+  ensure_ui
+  init_groups_and_profiles
+  log_action "Script started"
+  main_menu
+
+  if [[ ${#ACTION_LOG[@]} -gt 0 ]]; then
+    ui_textbox "Session Summary" "Actions performed:\n\n$(printf '%s\n' "${ACTION_LOG[@]}")"
+  fi
+}
+
+main
